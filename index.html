@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#11151c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Leitstelle Unterfranken</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@400;600;700&family=IBM+Plex+Mono:wght@500&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="top">
+  <div class="brand">ILS Unterfranken</div>
+  <div class="clock" id="clock">Tag 1, 08:00</div>
+  <div class="credits"><span id="credits">0</span> <small>Credits</small> <b id="mult"></b></div>
+</header>
+<div id="map"></div>
+<div id="geo" hidden></div>
+<div id="buildhint" hidden>Tippe auf die Karte, wo die neue Wache stehen soll</div>
+<div id="toasts"></div>
+<section id="sheet" aria-live="polite">
+  <div class="grab"><button id="sheetclose" aria-label="Schließen">Schließen</button></div>
+  <div id="sheetbody"></div>
+</section>
+<nav id="nav">
+  <button id="nav-map">Karte</button>
+  <button id="nav-mis">Einsätze <span id="miscount" class="badge" hidden>0</span></button>
+  <button id="nav-st">Wachen</button>
+  <button id="nav-school">Schulen</button>
+  <button id="nav-more">Mehr</button>
+</nav>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="data.js"></script>
+<script src="game.js"></script>
+</body>
+</html>
