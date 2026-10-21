@@ -68,3 +68,5 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .mk.mis div{border-radius:6px;font-weight:700}
 .leaflet-control-attribution{font-size:10px}
 @media (prefers-reduced-motion: reduce){#sheet{transition:none}}
+
+.mini.x{display:grid;place-items:center;flex:none;margin-left:4px}
