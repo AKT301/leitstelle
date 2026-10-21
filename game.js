@@ -25,7 +25,7 @@ function log(msg){ S.log.unshift({t:S.time, m:msg}); S.log.length=Math.min(S.log
 // ---------- Neues Spiel ----------
 function newGame(){
   S = {v:1, time:8*60, credits:100000, mult:1, rate:6, timeScale:4, courseMin:10, showSilent:true,
-       stations:{}, vehicles:{}, missions:{}, courses:[], geo:{}, log:[], nextId:0, helpRate:1.5, earned:0, done:0};
+       stations:{}, vehicles:{}, missions:{}, courses:[], geo:{}, log:[], nextId:0, helpRate:0.5, earned:0, done:0};
   for(const st of START_STATIONS) addStation(Object.assign({}, st, {own:true}), st.veh);
   for(const st of SILENT){
     const list = st.veh ? st.veh.slice() : estimateVehicles(st.cnt||2);
@@ -182,13 +182,13 @@ function placeNear(){
   const spots = Object.values(S.stations).filter(s => s.type==='fw' && area.has(gemeindeOf(s)));
   const base = spots.length ? pick(spots) : pick(ownBases());
   const name = (base.n.match(/^(?:FF|WF)\s+(.+)$/)||[])[1] || gemeindeOf(base) || base.n;
-  return {name, lat:base.lat+rnd(-0.005,0.005), lng:base.lng+rnd(-0.008,0.008)};
+  return {name, gem:gemeindeOf(base), lat:base.lat+rnd(-0.005,0.005), lng:base.lng+rnd(-0.008,0.008)};
 }
 function createMission(def, kind, extra){
   const pl = (extra && extra.place) || placeNear();
   const mid = id('m');
   const mis = {id:mid, n:def.n, st:def.st||'', kind:kind||'normal', lat:pl.lat, lng:pl.lng, place:pl.name,
-    req:Object.assign({}, def.r), cr:Math.round((def.cr||0)*rnd(0.85,1.15)), d:def.d, patients:[], prisoners:0,
+    gem: pl.gem || '', req:Object.assign({}, def.r), cr:Math.round((def.cr||0)*rnd(0.85,1.15)), d:def.d, patients:[], prisoners:0,
     created:S.time, work:null, esc:def.esc||null, escalated:false};
   const np = def.p ? rint(def.p[0], def.p[1]) : 0;
   for(let i=0;i<np;i++) mis.patients.push({nef: Math.random() < (def.nef||0), dept: def.dept || pick(['Innere','Chirurgie','Unfallchirurgie']), done:false});
@@ -311,6 +311,12 @@ function sendHome(v){
   const st = S.stations[v.station];
   v.mission = null; startLeg(v, st, 1, 0, false);
 }
+function dropMission(mid){ // Einsatz ablehnen bzw. an Nachbarn abgeben
+  const mis = S.missions[mid]; if(!mis) return;
+  for(const v of missionVehicles(mis)) sendHome(v);
+  delete S.missions[mid];
+  toast(mis.kind==='help' ? `Hilfeersuchen abgelehnt: ${mis.n}` : `Einsatz abgegeben: ${mis.n} in ${mis.place}`);
+}
 function cancelVehicle(v){ if(v.status===3){ v.mission=null; sendHome(v); } }
 
 // Hilfeersuchen einer Nachbarwehr
@@ -328,7 +334,7 @@ function helpRequest(){
   const city = (from.addr.match(/\d{5} (.+)$/)||[])[1] || from.addr || from.n;
   const place = {name: city, lat: from.lat + rnd(-0.01,0.01), lng: from.lng + rnd(-0.01,0.01)};
   const mis = createMission(def, 'help', {place, from: from.n, expires: S.time + 15});
-  toast(`${from.n} bittet um Unterstützung: ${ROLES[role]}`, 'warn');
+  toast(`${from.n} bittet um ${ROLES[role]}. Ohne Antwort übernimmt eine andere Wache`, 'warn');
 }
 
 // Großschadenslage
@@ -338,6 +344,21 @@ function startGSL(i){
   const mis = createMission(g, 'gsl');
   toast(`GROSSSCHADENSLAGE: ${g.n} in ${mis.place}`, 'warn');
   openMission(mis.id);
+}
+
+// Einsätze außerhalb des eigenen Gebiets, zu denen noch niemand fährt, übernehmen die Stillen
+function missionGem(mis){
+  if(mis.gem) return mis.gem;
+  const near = Object.values(S.stations).filter(s => s.type==='fw').sort((a,b) => km(a, mis) - km(b, mis))[0];
+  return near ? gemeindeOf(near) : '';
+}
+function cleanupForeign(){
+  const area = ownArea(); let n = 0;
+  for(const mis of Object.values(S.missions)){
+    if(mis.kind!=='normal') continue;
+    if(!area.has(missionGem(mis)) && !missionVehicles(mis).length){ delete S.missions[mis.id]; n++; }
+  }
+  if(n) toast(`${n} Einsätze außerhalb deines Gebiets an die Nachbarwachen abgegeben`, 'ok');
 }
 
 // ---------- Simulation ----------
@@ -496,7 +517,7 @@ function renderMissionList(){
   let h = `<h2>Einsätze</h2>`;
   if(!list.length) h += `<p class="muted">Gerade ruhig. Neue Einsätze kommen, solange das Spiel offen ist.</p>`;
   for(const mis of list){ const s=missionState(mis);
-    h += `<button class="row mis-${s}" data-open="${mis.id}"><span class="dot"></span><span class="grow"><b>${esc(mis.n)}</b><br><small>${esc(mis.st)} · ${esc(mis.place)}${mis.from?' · von '+esc(mis.from):''}</small></span><span class="tag">${s==='work'?'läuft':s==='coming'?'Anfahrt':'offen'}</span></button>`; }
+    h += `<button class="row mis-${s}" data-open="${mis.id}"><span class="dot"></span><span class="grow"><b>${esc(mis.n)}</b><br><small>${esc(mis.st)} · ${esc(mis.place)}${mis.from?' · von '+esc(mis.from):''}</small></span><span class="tag">${s==='work'?'läuft':s==='coming'?'Anfahrt':'offen'}</span><span class="mini x" data-drop="${mis.id}" role="button" aria-label="Einsatz löschen">✕</span></button>`; }
   h += `<h3>Großschadenslage starten</h3><div class="grid2">` + GSL.map((g,i)=>`<button class="btn sec" data-gsl="${i}">${esc(g.n)}</button>`).join('') + `</div>`;
   if(sheetView==='missions' && $('#sheetbody').dataset.sig === sig(h)) return;
   openSheet('missions', h); $('#sheetbody').dataset.sig = sig(h);
@@ -528,6 +549,7 @@ function renderMission(force){
     .map(v => ({v, eta:etaTo(v, mis), ready:vehReady(v)})).sort((a,b)=>a.eta-b.eta).slice(0,25);
   for(const o of ownFree) h += `<label class="vrow ${o.ready?'':'off'}"><input type="checkbox" value="${o.v.id}" ${o.ready?'':'disabled'}><span class="grow">${esc(o.v.name)}<br><small>${esc(S.stations[o.v.station].n)} · ${VT[o.v.type].roles.map(r=>ROLES[r]).join(', ')}${o.ready?'':' · Besatzung nicht ausgebildet'}</small></span><span>${dur(o.eta)}</span></label>`;
   h += `</div><button class="btn full" id="b-alarm">Alarmieren</button>`;
+  h += `<button class="btn danger full" data-drop="${mis.id}">${mis.kind==='help'?'Hilfeersuchen ablehnen':'Einsatz abgeben (übernimmt Nachbarwache)'}</button>`;
   if(vs.length){ h += `<h3>Alarmierte Fahrzeuge</h3>`;
     for(const v of vs) h += `<div class="vrow"><span class="grow">${esc(v.name)}<br><small>${esc(S.stations[v.station].n)}${S.stations[v.station].own?'':' (Nachbar)'}</small></span><span>${v.status===4?'vor Ort':'Anfahrt '+dur(Math.max(0,v.t1-S.time))}</span>${v.status===3?`<button class="mini" data-cancel="${v.id}">✕</button>`:''}</div>`; }
   // Neu zeichnen nur, wenn sich etwas Wesentliches geändert hat oder alle 5 Sekunden (Zeiten). Auswahl und Scrollposition bleiben erhalten.
@@ -608,6 +630,9 @@ function openMore(){
 
 // ---------- Ereignisse ----------
 document.addEventListener('click', e => {
+  const dropEl = e.target.closest('[data-drop]');
+  if(dropEl){ e.stopPropagation(); const id = dropEl.dataset.drop; const wasOpen = selMission===id; dropMission(id); save();
+    if(wasOpen) closeSheet(); else if(sheetView==='missions'){ $('#sheetbody').dataset.sig=''; renderMissionList(); } return; }
   const t = e.target.closest('button, [data-open]'); if(!t) return;
   const d = t.dataset;
   if(t.id==='nav-map'){ closeSheet(); return; }
@@ -656,6 +681,8 @@ window.addEventListener('pagehide', save);
 function start(){
   if(!load()) { newGame(); save(); }
   // Korrekturen für ältere Spielstände
+  if(S.helpRate===1.5) S.helpRate = 0.5;
+  cleanupForeign();
   for(const st of Object.values(S.stations)){ if(st.addr==='Gönz, 63916 Amorbach') st.addr='Gönz'; if(st.addr==='Roßbacher Straße 119, 63820 Elsenfeld') st.addr='Roßbacher Straße 119, Roßbach'; }
   lastReal = Date.now(); // Zeit läuft nur, solange das Spiel offen ist
   initMap(); render();
