@@ -66,16 +66,79 @@ function vehPos(v){
   if((v.status===3||v.status===1||v.status===7) && v.t1){
     const f = Math.max(0, Math.min(1, (S.time - v.t0)/(v.t1 - v.t0 || 1)));
     if(S.time < v.t0) return {lat:v.from.lat, lng:v.from.lng};
+    const r = v.leg && ROUTES[v.leg.key];
+    if(r && v.leg.ok) return alongPath(r, f);
     return {lat:v.from.lat+(v.to.lat-v.from.lat)*f, lng:v.from.lng+(v.to.lng-v.from.lng)*f};
   }
   return {lat:v.lat, lng:v.lng};
+}
+
+// ---------- Echte Straßen (OSRM-Routendienst von FOSSGIS, max. 1 Anfrage pro Sekunde) ----------
+const ROUTES = {};            // Schlüssel → {pts:[[lat,lng]], cum:[km], len, min}
+const routeQueue = []; const routeWait = {};
+const SONDERRECHTE = 0.8;     // mit Blaulicht schneller als normaler Verkehr
+function routeKey(a, b){ const r = x => x.toFixed(4); return r(a.lat)+','+r(a.lng)+'>'+r(b.lat)+','+r(b.lng); }
+function alongPath(r, f){
+  const target = f * r.len; const c = r.cum;
+  let i = 1; while(i < c.length-1 && c[i] < target) i++;
+  const seg = c[i]-c[i-1] || 1, t = Math.max(0, Math.min(1, (target-c[i-1])/seg));
+  const a = r.pts[i-1], b = r.pts[i];
+  return {lat:a[0]+(b[0]-a[0])*t, lng:a[1]+(b[1]-a[1])*t};
+}
+function requestRoute(from, to, cb){
+  const key = routeKey(from, to);
+  if(ROUTES[key]) { cb(key); return key; }
+  if(routeWait[key]) { routeWait[key].push(cb); return key; }
+  routeWait[key] = [cb]; routeQueue.push({key, from, to});
+  return key;
+}
+let routeBusy = false;
+async function routeWorker(){
+  if(routeBusy) return;
+  const job = routeQueue.shift(); if(!job) return;
+  routeBusy = true;
+  try{ await routeFetch(job); } finally { routeBusy = false; }
+}
+async function routeFetch(job){
+  try{
+    const url = `https://router.project-osrm.org/route/v1/driving/${job.from.lng},${job.from.lat};${job.to.lng},${job.to.lat}?overview=simplified&geometries=geojson`;
+    const res = await fetch(url); const j = await res.json();
+    const rt = j.routes && j.routes[0];
+    if(rt){
+      const pts = rt.geometry.coordinates.map(c => [c[1], c[0]]);
+      const cum = [0]; for(let i=1;i<pts.length;i++) cum.push(cum[i-1] + km({lat:pts[i-1][0],lng:pts[i-1][1]}, {lat:pts[i][0],lng:pts[i][1]}));
+      ROUTES[job.key] = {pts, cum, len: cum[cum.length-1] || 0.01, min: rt.duration/60};
+    }
+  }catch(e){ /* offline: Luftlinie bleibt */ }
+  const cbs = routeWait[job.key] || []; delete routeWait[job.key];
+  if(ROUTES[job.key]) cbs.forEach(cb => cb(job.key));
+}
+// Startet eine Fahrt: zuerst Schätzung per Luftlinie, sobald die Route da ist, echte Strecke und Fahrzeit
+function startLeg(v, to, status, delay, blaulicht){
+  const from = vehPos(v);
+  v.status = status; v.from = from; v.to = {lat:to.lat, lng:to.lng};
+  v.t0 = S.time + (delay||0); v.t1 = v.t0 + driveMin(v, from, to);
+  v.leg = null;
+  if(VT[v.type].v > 150) return; // Hubschrauber fliegt direkt
+  if(status===1 && !S.stations[v.station].own) return; // Rückfahrt der Nachbarn ist unsichtbar, spart Anfragen
+  const leg = {key:null, ok:false, b:!!blaulicht}; v.leg = leg;
+  leg.key = requestRoute(from, to, key => {
+    if(v.leg !== leg) return; // Fahrzeug hat inzwischen einen neuen Auftrag
+    const r = ROUTES[key]; const minutes = r.min * (leg.b ? SONDERRECHTE : 1);
+    // bereits gefahrenen Anteil beibehalten, damit das Fahrzeug nicht springt
+    const done = S.time > v.t0 ? Math.min(0.95, (S.time - v.t0)/(v.t1 - v.t0 || 1)) : 0;
+    leg.ok = true;
+    if(done > 0){ v.t0 = S.time - done*minutes; }
+    v.t1 = v.t0 + minutes;
+  });
 }
 function driveMin(v, from, to){ const vt=VT[v.type]; const air = vt.v>150; const d=km(from,to)*(air?1:ROAD); return d/vt.v*60 + (air?1:0); }
 function etaTo(v, target){
   const st = S.stations[v.station];
   const p = vehPos(v);
   const turn = v.status===2 ? (TURNOUT[st.type]||3) : 0;
-  return turn + driveMin(v, p, target);
+  const known = VT[v.type].v <= 150 && ROUTES[routeKey(p, target)];
+  return turn + (known ? known.min * SONDERRECHTE : driveMin(v, p, target));
 }
 function vehReady(v){ // darf alarmiert werden
   if(!(v.status===2 || v.status===1)) return false;
@@ -97,13 +160,29 @@ function eligibleDefs(){
   return M.filter(d => Object.entries(d.c).every(([k,n]) => (c[k]||0) >= n) && Object.entries(d.r).every(([r,n]) => (tot[r]||0) >= n));
 }
 function ownBases(){ return Object.values(S.stations).filter(s => s.own && ['fw','rd','pol','thw','bepo','wr','seg'].includes(s.type)); }
+// ---------- Eigenes Gebiet: Gemeinden, in denen Alexander eine eigene Feuer- oder Rettungswache hat ----------
+function gemeindeOf(st){
+  if(st.gem) return st.gem;
+  const m = (st.addr||'').match(/\d{5}\s+(.+)$/);
+  if(m) return m[1].trim();
+  if(st.addr) return st.addr.split(',').pop().trim();
+  // ohne Adresse (z.B. selbst gebaute Wache): Gemeinde der nächsten Feuerwache
+  const near = Object.values(S.stations).filter(s => s !== st && s.type==='fw' && /\d{5}/.test(s.addr||''))
+    .sort((a,b) => km(a, st) - km(b, st))[0];
+  return near ? gemeindeOf(near) : '';
+}
+function ownArea(){
+  const g = new Set();
+  for(const st of Object.values(S.stations)) if(st.own && (st.type==='fw' || st.type==='rd')) g.add(gemeindeOf(st));
+  return g;
+}
 function placeNear(){
-  const bases = ownBases(); const base = pick(bases);
-  let cand = PLACES.filter(p => km({lat:p[1],lng:p[2]}, base) < 12);
-  if(!cand.length) cand = PLACES.slice().sort((a,b)=>km({lat:a[1],lng:a[2]},base)-km({lat:b[1],lng:b[2]},base)).slice(0,1);
-  const p = pick(cand); const g = S.geo['place:'+p[0]];
-  const c = g || {lat:p[1], lng:p[2]};
-  return {name:p[0], lat:c.lat+rnd(-0.006,0.006), lng:c.lng+rnd(-0.009,0.009)};
+  // Einsatzorte = Orte mit Feuerwehrhaus (jedes Dorf, jeder Ortsteil) in den eigenen Gemeinden
+  const area = ownArea();
+  const spots = Object.values(S.stations).filter(s => s.type==='fw' && area.has(gemeindeOf(s)));
+  const base = spots.length ? pick(spots) : pick(ownBases());
+  const name = (base.n.match(/^(?:FF|WF)\s+(.+)$/)||[])[1] || gemeindeOf(base) || base.n;
+  return {name, lat:base.lat+rnd(-0.005,0.005), lng:base.lng+rnd(-0.008,0.008)};
 }
 function createMission(def, kind, extra){
   const pl = (extra && extra.place) || placeNear();
@@ -155,8 +234,7 @@ function alarm(v, mis){
   const st = S.stations[v.station];
   const p = vehPos(v);
   const turn = v.status===2 ? (TURNOUT[st.type]||3) : 0;
-  v.mission = mis.id; v.status = 3; v.from = p; v.to = {lat:mis.lat, lng:mis.lng};
-  v.t0 = S.time + turn; v.t1 = v.t0 + driveMin(v, p, mis);
+  v.mission = mis.id; startLeg(v, mis, 3, turn, true);
 }
 function autoSelect(mis, ownOnly){ // AAO-Vorschlag: deckt fehlende Rollen mit den schnellsten Fahrzeugen
   const chosen = [], used = new Set();
@@ -200,7 +278,7 @@ function finishMission(mis){
   mis.patients.forEach((p, i) => {
     const r = rtws[i]; if(!r) return;
     const kh = chooseHospital(r, p.dept);
-    r.status = 7; r.from = vehPos(r); r.to = {lat:kh.lat, lng:kh.lng}; r.t0 = S.time; r.t1 = S.time + driveMin(r, r.from, kh);
+    startLeg(r, kh, 7, 0, p.nef);
     r.task = {kind:'patient', dest:kh.id, credits: RD_CREDITS_PER_PATIENT + (kh.dept.includes(p.dept)?100:0) + (p.nef?150:0)};
     r.mission = null;
   });
@@ -210,7 +288,7 @@ function finishMission(mis){
     let left = mis.prisoners;
     for(const f of fs){ if(left<=0) break;
       const pol = nearestStation(f, s => s.type==='pol');
-      f.status = 7; f.from = vehPos(f); f.to = {lat:pol.lat,lng:pol.lng}; f.t0=S.time; f.t1=S.time+driveMin(f,f.from,pol);
+      startLeg(f, pol, 7, 0, false);
       f.task = {kind:'prisoner', dest:pol.id, credits: 200*Math.min(left,2)}; f.mission=null; left -= 2; }
   }
   for(const v of vs) if(v.mission===mis.id) sendHome(v);
@@ -231,7 +309,7 @@ function chooseHospital(v, dept){
 function nearestStation(v, f){ return Object.values(S.stations).filter(f).map(s => ({s, d:km(vehPos(v), s)})).sort((a,b)=>a.d-b.d)[0].s; }
 function sendHome(v){
   const st = S.stations[v.station];
-  v.mission = null; v.status = 1; v.from = vehPos(v); v.to = {lat:st.lat, lng:st.lng}; v.t0 = S.time; v.t1 = S.time + driveMin(v, v.from, st);
+  v.mission = null; startLeg(v, st, 1, 0, false);
 }
 function cancelVehicle(v){ if(v.status===3){ v.mission=null; sendHome(v); } }
 
@@ -306,7 +384,8 @@ function buildStation(type, small, latlng, name){
   S.credits -= price;
   const startVeh = {fw:'LF 10', rd:'RTW', pol:'FuStW', rth:'RTH', phub:'PolHub', bepo:'GruKw', thw:'GKW', seg:'KTW-B', wr:'GW-WR'}[type];
   const st = addStation({type, n:name || b.n, lat:latlng.lat, lng:latlng.lng, own:true, small:!!small}, [[startVeh]]);
-  trainStartCrew(st);
+  trainStartCrew(st); st.gem = gemeindeOf(st);
+  if(type==='fw'||type==='rd') toast(`Neues eigenes Gebiet: ${st.gem}`, 'ok');
   toast(`${st.n} gebaut (−${fmt(price)} Credits)`, 'ok');
   return st;
 }
@@ -314,6 +393,7 @@ function takeOver(sid){
   const st = S.stations[sid]; const b = BT[st.type]; const price = b.price;
   if(S.credits < price){ toast('Nicht genug Credits'); return; }
   S.credits -= price; st.own = true; st.staff = b.staff; trainStartCrew(st);
+  if(st.type==='fw'||st.type==='rd') toast(`Neues eigenes Gebiet: ${gemeindeOf(st)}`, 'ok');
   toast(`${st.n} übernommen, mit ${st.veh.length} Fahrzeugen (−${fmt(price)} Credits)`, 'ok');
 }
 function slotsOf(st){ const b=BT[st.type]; return st.small && b.smallSlots ? b.smallSlots : b.slots; }
@@ -391,6 +471,8 @@ function drawDynamic(){
     if(v.status===2) continue;
     if(!S.stations[v.station].own && v.status===1) continue;
     const p = vehPos(v); const st=S.stations[v.station];
+    if(st.own && (v.status===3 || v.status===7) && v.leg && v.leg.ok && ROUTES[v.leg.key])
+      L.polyline(ROUTES[v.leg.key].pts, {color: COLORS[st.type]||'#333', weight:2, opacity:0.45, interactive:false}).addTo(layers.vehicles);
     L.circleMarker([p.lat, p.lng], {radius:5, color:'#fff', weight:1.5, fillColor: st.own ? (COLORS[st.type]||'#333') : '#8a8f98', fillOpacity:1}).addTo(layers.vehicles);
   }
 }
@@ -573,10 +655,13 @@ window.addEventListener('pagehide', save);
 // ---------- Start ----------
 function start(){
   if(!load()) { newGame(); save(); }
+  // Korrekturen für ältere Spielstände
+  for(const st of Object.values(S.stations)){ if(st.addr==='Gönz, 63916 Amorbach') st.addr='Gönz'; if(st.addr==='Roßbacher Straße 119, 63820 Elsenfeld') st.addr='Roßbacher Straße 119, Roßbach'; }
   lastReal = Date.now(); // Zeit läuft nur, solange das Spiel offen ist
   initMap(); render();
   setInterval(tick, 1000);
   setInterval(save, 5000);
+  setInterval(routeWorker, 1100); // Routendienst: höchstens eine Anfrage pro Sekunde
   setTimeout(() => geocodeAll(false), 1500);
 }
 if(typeof window!=='undefined' && window.L) start();
